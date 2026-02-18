@@ -1,0 +1,344 @@
+# -*- coding: utf-8 -*-
+"""
+[Step 4] Domain Adversarial Training (DANN) Autoencoder (Classifier Enhanced)
+Location: E:\2ndstructuredata\Code_3_SN_AE_CF\step4_dann_autoencoder.py
+Goal: 
+    1. Train DANN with Stronger Classifier.
+    2. Check Multi-Perplexity t-SNE Visualization.
+    3. Verify Reconstruction Quality.
+"""
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+import os
+import pickle
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.manifold import TSNE
+import matplotlib.pyplot as plt
+from scipy.signal import welch
+
+# =========================================================
+# 1. Configuration
+# =========================================================
+class Config:
+    DIR_A = r"E:\Benchmark Code\benchmarktu1402-master\f_accerlerations\ds1"
+    DIR_B = r"E:\2ndstructuredata\raw data"
+    FILE_B = "healthyclean.txt"
+    SAVE_DIR = r"E:\2ndstructuredata\Code_3_SN_AE_CF"
+    
+    WINDOW_SIZE = 128
+    LATENT_DIM = 8
+    BATCH_SIZE = 64
+    EPOCHS = 500
+    LR = 0.001
+    
+    SELECTED_NODES = [3, 21, 39, 57, 63, 81, 99, 117]
+    
+    # [설정] Adversarial Weight
+    # 분류기가 강해졌으므로 Lambda를 너무 낮추면 인코더가 질 수 있습니다.
+    # 0.05 정도로 유지하며 관찰합니다.
+    LAMBDA_ADV = 0.0006
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+cfg = Config()
+
+if not os.path.exists(cfg.SAVE_DIR):
+    os.makedirs(cfg.SAVE_DIR)
+
+# =========================================================
+# 2. Model Components (Enhanced Classifier)
+# =========================================================
+
+class GradientReversalFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, alpha):
+        ctx.alpha = alpha
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        output = grad_output.neg() * ctx.alpha
+        return output, None
+
+class GradientReversalLayer(nn.Module):
+    def __init__(self, alpha=1.0):
+        super(GradientReversalLayer, self).__init__()
+        self.alpha = alpha
+
+    def forward(self, x):
+        return GradientReversalFunction.apply(x, self.alpha)
+
+class Encoder(nn.Sequential):
+    def __init__(self, input_dim=128*8, latent_dim=8):
+        super().__init__(
+            nn.Linear(input_dim, 512), nn.Tanh(),
+            nn.Linear(512, 256), nn.Tanh(),
+            nn.Linear(256, 64), nn.Tanh(),
+            nn.Linear(64, latent_dim)
+        )
+
+class Decoder(nn.Sequential):
+    def __init__(self, latent_dim=8, output_dim=128*8):
+        super().__init__(
+            nn.Linear(latent_dim, 64), nn.Tanh(),
+            nn.Linear(64, 256), nn.Tanh(),
+            nn.Linear(256, 512), nn.Tanh(),
+            nn.Linear(512, output_dim)
+        )
+
+# [수정] 강화된 Domain Classifier (Deeper & Wider)
+class DomainClassifier(nn.Sequential):
+    def __init__(self, latent_dim=8):
+        super().__init__()
+        # 기존: 16 -> 8 -> 1
+        # 강화: 64 -> 32 -> 16 -> 1
+        self.add_module("fc1", nn.Linear(latent_dim, 64))
+        self.add_module("act1", nn.ReLU())
+        self.add_module("fc2", nn.Linear(64, 32))
+        self.add_module("act2", nn.ReLU())
+        self.add_module("fc3", nn.Linear(32, 16))
+        self.add_module("act3", nn.ReLU())
+        self.add_module("fc4", nn.Linear(16, 1))
+        self.add_module("sigmoid", nn.Sigmoid())
+
+class DANN_Autoencoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.encoder = Encoder(input_dim=cfg.WINDOW_SIZE*8, latent_dim=cfg.LATENT_DIM)
+        self.decoder = Decoder(latent_dim=cfg.LATENT_DIM, output_dim=cfg.WINDOW_SIZE*8)
+        self.classifier = DomainClassifier(latent_dim=cfg.LATENT_DIM)
+        self.grl = GradientReversalLayer(alpha=cfg.LAMBDA_ADV)
+
+    def forward(self, x):
+        z = self.encoder(x)
+        recon = self.decoder(z)
+        z_reverse = self.grl(z)
+        domain_pred = self.classifier(z_reverse)
+        return recon, domain_pred, z
+
+# =========================================================
+# 3. Utility Functions
+# =========================================================
+def load_data(path, is_A=False):
+    try:
+        if is_A:
+            data = np.loadtxt(path)
+            if data.shape[0] > data.shape[1]: 
+                data = data[:, cfg.SELECTED_NODES].T
+            else: 
+                data = data[cfg.SELECTED_NODES, :]
+        else:
+            raw = []
+            with open(path, 'r') as f:
+                for line in f:
+                    p = line.split()
+                    if len(p) >= 2: raw.append(float(p[1]))
+            data = np.array(raw, dtype=np.float32).reshape(8, -1)
+        return data.astype(np.float32)
+    except Exception as e:
+        print(f"Error loading {path}: {e}")
+        return None
+
+def load_and_normalize(path, is_A=False):
+    raw_data = load_data(path, is_A)
+    if raw_data is None: return None, None
+    
+    n_points = raw_data.shape[1]
+    n_samples = n_points // cfg.WINDOW_SIZE
+    valid_len = n_samples * cfg.WINDOW_SIZE
+    data = raw_data[:, :valid_len]
+    
+    reshaped = data.reshape(8, n_samples, cfg.WINDOW_SIZE).transpose(1, 0, 2).reshape(n_samples, -1)
+    
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    norm_data = scaler.fit_transform(reshaped)
+    
+    return norm_data, scaler
+
+def visualize_reconstruction(name, raw_data, model, scaler, samples_to_plot=10000):
+    print(f"\n   -> Visualizing Reconstruction for {name} (First {samples_to_plot} pts)...")
+    
+    n_points = raw_data.shape[1]
+    n_samples = n_points // cfg.WINDOW_SIZE
+    valid_len = n_samples * cfg.WINDOW_SIZE
+    data = raw_data[:, :valid_len]
+    
+    reshaped = data.reshape(8, n_samples, cfg.WINDOW_SIZE).transpose(1, 0, 2).reshape(n_samples, -1)
+    norm_input = scaler.transform(reshaped)
+    
+    model.eval()
+    with torch.no_grad():
+        recon_norm, _, _ = model(torch.FloatTensor(norm_input).to(cfg.device))
+        recon_norm = recon_norm.cpu().numpy()
+        
+    recon_phys = scaler.inverse_transform(recon_norm)
+    recon_reshaped = recon_phys.reshape(n_samples, 8, cfg.WINDOW_SIZE).transpose(1, 0, 2).reshape(8, -1)
+    
+    limit = min(samples_to_plot, data.shape[1])
+    real_wave = data[0, :limit]
+    recon_wave = recon_reshaped[0, :limit]
+    
+    f_real, p_real = welch(data[0, :], fs=100, nperseg=256)
+    f_recon, p_recon = welch(recon_reshaped[0, :], fs=100, nperseg=256)
+    
+    fig, axs = plt.subplots(2, 1, figsize=(10, 8))
+    axs[0].plot(real_wave, 'k-', label='Real Input', alpha=0.6, linewidth=1)
+    axs[0].plot(recon_wave, 'r--', label='Reconstructed (DANN)', alpha=0.8, linewidth=1)
+    axs[0].set_title(f"{name} - Time Domain (Zoomed)")
+    axs[0].legend(loc='upper right')
+    axs[0].grid(True, alpha=0.3)
+    
+    axs[1].semilogy(f_real, p_real, 'k-', label='Real PSD', alpha=0.6)
+    axs[1].semilogy(f_recon, p_recon, 'r--', label='Reconstructed PSD', alpha=0.8)
+    axs[1].set_title(f"{name} - Frequency Domain")
+    axs[1].set_xlabel("Frequency (Hz)"); axs[1].set_ylabel("PSD")
+    axs[1].legend(loc='upper right')
+    axs[1].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(cfg.SAVE_DIR, f"reconstruction_{name}.png"))
+    plt.show()
+
+# =========================================================
+# 4. Training Logic
+# =========================================================
+def train():
+    print("[DANN Training] Started...")
+    
+    norm_A, scaler_A = load_and_normalize(os.path.join(cfg.DIR_A, "fh_accelerations.dat"), is_A=True)
+    norm_B, scaler_B = load_and_normalize(os.path.join(cfg.DIR_B, cfg.FILE_B), is_A=False)
+    
+    if norm_A is None or norm_B is None:
+        return None, None, None, None, None, None
+
+    labels_A = np.zeros((len(norm_A), 1))
+    labels_B = np.ones((len(norm_B), 1))
+    
+    X = np.vstack([norm_A, norm_B])
+    y = np.vstack([labels_A, labels_B])
+    
+    dataset = TensorDataset(torch.FloatTensor(X), torch.FloatTensor(y))
+    loader = DataLoader(dataset, batch_size=cfg.BATCH_SIZE, shuffle=True)
+    
+    model = DANN_Autoencoder().to(cfg.device)
+    optimizer = optim.Adam(model.parameters(), lr=cfg.LR)
+    
+    criterion_recon = nn.MSELoss()
+    criterion_domain = nn.BCELoss()
+    
+    history = {'loss_recon': [], 'loss_domain': [], 'acc_domain': []}
+    
+    print(f"   -> Training for {cfg.EPOCHS} epochs with Lambda={cfg.LAMBDA_ADV}...")
+    for epoch in range(cfg.EPOCHS):
+        model.train()
+        total_recon, total_domain, correct_domain, total_samples = 0, 0, 0, 0
+        
+        for batch_x, batch_y in loader:
+            batch_x, batch_y = batch_x.to(cfg.device), batch_y.to(cfg.device)
+            
+            optimizer.zero_grad()
+            recon, domain_pred, z = model(batch_x)
+            
+            loss_r = criterion_recon(recon, batch_x)
+            loss_d = criterion_domain(domain_pred, batch_y)
+            loss = loss_r + loss_d 
+            
+            loss.backward()
+            optimizer.step()
+            
+            total_recon += loss_r.item()
+            total_domain += loss_d.item()
+            
+            predicted = (domain_pred > 0.5).float()
+            correct_domain += (predicted == batch_y).sum().item()
+            total_samples += batch_y.size(0)
+            
+        avg_recon = total_recon / len(loader)
+        avg_domain = total_domain / len(loader)
+        acc_domain = correct_domain / total_samples * 100
+        
+        history['loss_recon'].append(avg_recon)
+        history['loss_domain'].append(avg_domain)
+        history['acc_domain'].append(acc_domain)
+        
+        if (epoch+1) % 50 == 0:
+            print(f"   Epoch {epoch+1}/{cfg.EPOCHS} | Recon: {avg_recon:.6f} | Domain: {avg_domain:.6f} | Acc: {acc_domain:.2f}%")
+
+    torch.save(model.encoder.state_dict(), os.path.join(cfg.SAVE_DIR, "encoder_dann.pth"))
+    torch.save(model.decoder.state_dict(), os.path.join(cfg.SAVE_DIR, "decoder_dann.pth"))
+    with open(os.path.join(cfg.SAVE_DIR, "scaler_A_dann.pkl"), 'wb') as f: pickle.dump(scaler_A, f)
+    with open(os.path.join(cfg.SAVE_DIR, "scaler_B_dann.pkl"), 'wb') as f: pickle.dump(scaler_B, f)
+    
+    return model, norm_A, norm_B, scaler_A, scaler_B, history
+
+# =========================================================
+# 5. Visualization (Multi-Perplexity t-SNE)
+# =========================================================
+def visualize_latent_space_multi(model, norm_A, norm_B):
+    """
+    Visualize t-SNE with multiple perplexity values to find optimal structure.
+    """
+    print("\n[Visualization] Running Multi-Perplexity t-SNE...")
+    model.eval()
+    with torch.no_grad():
+        z_A = model.encoder(torch.FloatTensor(norm_A).to(cfg.device)).cpu().numpy()
+        z_B = model.encoder(torch.FloatTensor(norm_B).to(cfg.device)).cpu().numpy()
+        
+    z_all = np.vstack([z_A, z_B])
+    labels = np.hstack([np.zeros(len(z_A)), np.ones(len(z_B))])
+    
+    # Sampling if too large
+    if len(z_all) > 3000:
+        idx = np.random.choice(len(z_all), 3000, replace=False)
+        z_all = z_all[idx]
+        labels = labels[idx]
+    
+    # [수정] 여러 Perplexity 값으로 테스트
+    perplexities = [30, 50, 100]
+    
+    plt.figure(figsize=(18, 5))
+    for i, perp in enumerate(perplexities):
+        print(f"   -> Processing t-SNE with perplexity={perp}...")
+        tsne = TSNE(n_components=2, random_state=42, perplexity=perp, init='pca', learning_rate='auto')
+        z_embedded = tsne.fit_transform(z_all)
+        
+        plt.subplot(1, 3, i+1)
+        plt.scatter(z_embedded[labels==0, 0], z_embedded[labels==0, 1], c='blue', label='A', alpha=0.5, s=10)
+        plt.scatter(z_embedded[labels==1, 0], z_embedded[labels==1, 1], c='red', label='B', alpha=0.5, s=10)
+        plt.title(f"Perplexity={perp}")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+    plt.tight_layout()
+    plt.savefig(os.path.join(cfg.SAVE_DIR, "tsne_multi_perplexity.png"))
+    plt.show()
+    print("   -> t-SNE Multi-Perplexity Plot Saved.")
+
+def main():
+    model, norm_A, norm_B, scaler_A, scaler_B, history = train()
+    if model is None: return
+
+    # History Plot
+    plt.figure(figsize=(12, 4))
+    plt.subplot(1, 3, 1); plt.plot(history['loss_recon']); plt.title("Recon Loss")
+    plt.subplot(1, 3, 2); plt.plot(history['loss_domain']); plt.title("Domain Loss")
+    plt.subplot(1, 3, 3); plt.plot(history['acc_domain']); plt.title("Domain Acc")
+    plt.savefig(os.path.join(cfg.SAVE_DIR, "training_history.png"))
+    plt.show()
+    
+    # [수정] 여러 t-SNE 결과 확인
+    visualize_latent_space_multi(model, norm_A, norm_B)
+    
+    print("\n>>> Checking Reconstruction Quality...")
+    raw_A = load_data(os.path.join(cfg.DIR_A, "fh_accelerations.dat"), is_A=True)
+    visualize_reconstruction("Structure_A_Healthy", raw_A, model, scaler_A, samples_to_plot=5000)
+    
+    raw_B_48 = load_data(os.path.join(cfg.DIR_B, "D1_48_1.txt"), is_A=False)
+    visualize_reconstruction("Structure_B_Case48", raw_B_48, model, scaler_B, samples_to_plot=5000)
+
+if __name__ == "__main__":
+    main()
