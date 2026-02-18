@@ -1,0 +1,347 @@
+# -*- coding: utf-8 -*-
+"""
+[Step 6] Final Validation: DeepONet with DANN Encoder
+Location: E:\2ndstructuredata\Code_3_SN_AE_CF\step6_final_validation.py
+Goal: 
+    1. Load trained DANN Encoder & DeepONet.
+    2. Validate DI Trends for Structure A & B using [0.1, 1.0] scaling.
+    3. Generate comparison plots (DI Trend, Waveform, PSD).
+"""
+
+import numpy as np
+import torch
+import torch.nn as nn
+import os
+import pickle
+from scipy.stats import kurtosis
+from scipy.signal import welch
+import matplotlib.pyplot as plt
+
+# =========================================================
+# 1. Configuration
+# =========================================================
+class Config:
+    # 경로 설정
+    BASE_DIR = r"E:\2ndstructuredata"
+    CODE_DIR = r"E:\2ndstructuredata\Code_3_SN_AE_CF"
+    
+    DIR_A = r"E:\Benchmark Code\benchmarktu1402-master\f_accerlerations\ds1"
+    DIR_B = r"E:\2ndstructuredata\raw data"
+    FILE_B = "healthyclean.txt"
+    
+    # 모델 경로 (DANN & DeepONet)
+    ENCODER_PATH = os.path.join(CODE_DIR, "encoder_dann.pth")
+    DEEPONET_PATH = os.path.join(CODE_DIR, "deeponet_model.pth")
+    
+    # 스케일러 경로 (DANN 학습 시 저장된 것)
+    SCALER_A_PATH = os.path.join(CODE_DIR, "scaler_A_dann.pkl")
+    SCALER_B_PATH = os.path.join(CODE_DIR, "scaler_B_dann.pkl")
+    
+    WINDOW_SIZE = 128
+    LATENT_DIM = 8
+    SELECTED_NODES = [3, 21, 39, 57, 63, 81, 99, 117]
+    
+    DAMAGE_CASES_A = list(range(1, 11))
+    DAMAGE_CASES_B = [4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48] 
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+cfg = Config()
+
+# =========================================================
+# 2. Model Definitions (Must match training structure)
+# =========================================================
+class Encoder(nn.Sequential):
+    def __init__(self, input_dim=128*8, latent_dim=8):
+        super().__init__(
+            nn.Linear(input_dim, 512), nn.Tanh(),
+            nn.Linear(512, 256), nn.Tanh(),
+            nn.Linear(256, 64), nn.Tanh(),
+            nn.Linear(64, latent_dim)
+        )
+
+class FourierFeature(nn.Module):
+    def __init__(self, input_dim, mapping_size=128, scale=10):
+        super().__init__()
+        self.register_buffer('B', torch.randn(input_dim, mapping_size) * scale)
+    def forward(self, x):
+        projected = 2 * np.pi * (x @ self.B)
+        return torch.cat([torch.sin(projected), torch.cos(projected)], dim=-1)
+
+class DeepONet(nn.Module):
+    def __init__(self, branch_dim=9, trunk_dim=2, hidden_dim=128):
+        super().__init__()
+        self.branch = nn.Sequential(
+            nn.Linear(branch_dim, hidden_dim), nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        self.fourier = FourierFeature(trunk_dim)
+        self.trunk = nn.Sequential(
+            nn.Linear(256, hidden_dim), nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        self.bias = nn.Parameter(torch.zeros(1))
+
+    def forward(self, branch_in, trunk_in):
+        B = self.branch(branch_in)
+        T = self.trunk(self.fourier(trunk_in))
+        return torch.matmul(B, T.T) + self.bias
+
+# =========================================================
+# 3. Utility Functions
+# =========================================================
+def load_data(path, is_A=False):
+    try:
+        if is_A:
+            data = np.loadtxt(path)
+            if data.shape[0] > data.shape[1]: data = data[:, cfg.SELECTED_NODES].T
+            else: data = data[cfg.SELECTED_NODES, :]
+        else:
+            raw = []
+            with open(path, 'r') as f:
+                for line in f:
+                    p = line.split()
+                    if len(p) >= 2: raw.append(float(p[1]))
+            data = np.array(raw, dtype=np.float32).reshape(8, -1)
+        return data.astype(np.float32)
+    except Exception as e:
+        print(f"Error loading {path}: {e}")
+        return None
+
+def normalize_data(raw_data, scaler):
+    n_points = raw_data.shape[1]
+    n_samples = n_points // cfg.WINDOW_SIZE
+    valid_len = n_samples * cfg.WINDOW_SIZE
+    data = raw_data[:, :valid_len]
+    reshaped = data.reshape(8, n_samples, cfg.WINDOW_SIZE).transpose(1, 0, 2).reshape(n_samples, -1)
+    normalized = scaler.transform(reshaped)
+    return normalized, n_samples
+
+def calc_di_metric(healthy, damaged):
+    calc_window = 2000
+    min_len = min(healthy.shape[1], damaged.shape[1])
+    n_wins = min_len // calc_window
+    if n_wins < 1: n_wins = 1; calc_window = min_len
+    
+    di_list = []
+    for i in range(8):
+        val_len = n_wins * calc_window
+        h_wins = healthy[i, :val_len].reshape(n_wins, calc_window)
+        d_wins = damaged[i, :val_len].reshape(n_wins, calc_window)
+        k_h = kurtosis(h_wins, axis=1, fisher=False)
+        k_d = kurtosis(d_wins, axis=1, fisher=False)
+        val_h = np.percentile(k_h, 95)
+        val_d = np.percentile(k_d, 95)
+        di_list.append(abs(val_h - val_d))
+    return np.mean(di_list)
+
+def rescale_di(real_di, min_di, max_di):
+    """DI Rescaling [0.1 ~ 1.0]"""
+    if max_di == min_di: return 0.1
+    norm = (real_di - min_di) / (max_di - min_di)
+    return 0.1 + norm * 0.9
+
+def visualize_comparison(name, real_h, real_d, input_di, encoder, deeponet, scaler, trunk_fixed, steps=8):
+    """
+    Generate & Compare Waveform/PSD using DeepONet Prediction
+    DeepONet predicts RESIDUAL (Normalized).
+    Gen = Healthy + Inverse(Residual_Norm)
+    """
+    # 1. Prepare Healthy Latent (z)
+    norm_h_full, _ = normalize_data(real_h, scaler)
+    limit = min(steps, len(norm_h_full))
+    norm_h_cut = norm_h_full[:limit] 
+    
+    with torch.no_grad():
+        z_vec = encoder(torch.FloatTensor(norm_h_cut).to(cfg.device)).detach().cpu().numpy()
+        
+        # 2. DeepONet Prediction
+        b_in = np.hstack([z_vec, np.full((limit, 1), input_di)])
+        B_out = deeponet.branch(torch.FloatTensor(b_in).to(cfg.device))
+        T_out = deeponet.trunk(deeponet.fourier(trunk_fixed))
+        p = torch.matmul(B_out, T_out.T) + deeponet.bias
+        pred_res_norm = p.detach().cpu().numpy() # Normalized Residual
+    
+    # 3. Inverse Transform & Reconstruct
+    # 중요: DeepONet은 잔차(Residual)를 학습했습니다.
+    # 스케일러 역변환 시, 잔차만 따로 역변환하는 것이 아니라,
+    # "정규화된 건강 데이터 + 정규화된 예측 잔차"를 합친 후 역변환하는 것이
+    # 스케일러의 min/max 바이어스를 피하는 안전한 방법입니다.
+    # 하지만 여기서는 잔차 학습 로직(Step 5)에서 norm_d - norm_h를 Target으로 했으므로,
+    # pred_res_norm은 순수 잔차입니다.
+    # 따라서 (norm_h + pred_res) -> inverse 가 맞습니다.
+    
+    gen_norm = norm_h_cut + pred_res_norm
+    gen_phys = scaler.inverse_transform(gen_norm)
+    
+    # Reshape
+    res_reshaped = gen_phys.reshape(limit, 8, cfg.WINDOW_SIZE).transpose(1, 0, 2).reshape(8, -1)
+    gen_data = res_reshaped # This is the full generated signal
+    
+    # 4. Plot
+    real_wave = real_d[0, :res_reshaped.shape[1]]
+    gen_wave = gen_data[0, :res_reshaped.shape[1]]
+    
+    f_real, p_real = welch(real_wave, fs=100, nperseg=256)
+    f_gen, p_gen = welch(gen_wave, fs=100, nperseg=256)
+    
+    fig, axs = plt.subplots(2, 1, figsize=(10, 8))
+    
+    axs[0].plot(real_wave, 'k--', label='Real Damaged')
+    axs[0].plot(gen_wave, 'r-', label='Generated (DeepONet)', alpha=0.7)
+    axs[0].set_title(f"{name} - Time Domain")
+    axs[0].legend(); axs[0].grid(True, alpha=0.3)
+    
+    axs[1].semilogy(f_real, p_real, 'k--', label='Real PSD')
+    axs[1].semilogy(f_gen, p_gen, 'r-', label='Generated PSD', linewidth=2, alpha=0.7)
+    axs[1].set_title(f"{name} - Frequency Domain")
+    axs[1].set_xlabel("Frequency (Hz)"); axs[1].set_ylabel("PSD")
+    axs[1].legend(); axs[1].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(cfg.CODE_DIR, f"final_visual_{name}.png"))
+    plt.show()
+
+# =========================================================
+# 4. Main Validation Logic
+# =========================================================
+def main():
+    print("[Step 6] Final Validation Started...")
+    
+    if not os.path.exists(cfg.CODE_DIR):
+        print(f"Error: Directory {cfg.CODE_DIR} not found.")
+        return
+
+    # Load Resources
+    with open(cfg.SCALER_A_PATH, 'rb') as f: scaler_A = pickle.load(f)
+    with open(cfg.SCALER_B_PATH, 'rb') as f: scaler_B = pickle.load(f)
+
+    encoder = Encoder().to(cfg.device)
+    encoder.load_state_dict(torch.load(cfg.ENCODER_PATH))
+    encoder.eval()
+    
+    deeponet = DeepONet(branch_dim=9, trunk_dim=2).to(cfg.device)
+    deeponet.load_state_dict(torch.load(cfg.DEEPONET_PATH))
+    deeponet.eval()
+    
+    # Trunk Input
+    t_space = np.linspace(0, 1, cfg.WINDOW_SIZE)
+    x_space = np.linspace(0, 1, 8)
+    T_grid, X_grid = np.meshgrid(t_space, x_space)
+    trunk_fixed = torch.FloatTensor(np.stack([T_grid.flatten(), X_grid.flatten()], axis=1)).to(cfg.device)
+    
+    # --- PART 1: DI Range Calculation ---
+    print("\n>>> Calculating DI Ranges...")
+    raw_h_A = load_data(os.path.join(cfg.DIR_A, "fh_accelerations.dat"), is_A=True)
+    temp_dis_A = []
+    for c in cfg.DAMAGE_CASES_A:
+        d = load_data(os.path.join(cfg.DIR_A, f"f{c}_accelerations.dat"), is_A=True)
+        temp_dis_A.append(calc_di_metric(raw_h_A, d))
+    min_A, max_A = min(temp_dis_A), max(temp_dis_A)
+    
+    raw_h_B = load_data(os.path.join(cfg.DIR_B, cfg.FILE_B), is_A=False)
+    temp_dis_B = []
+    for c in cfg.DAMAGE_CASES_B:
+        d = load_data(os.path.join(cfg.DIR_B, f"D1_{c}_1.txt"), is_A=False)
+        temp_dis_B.append(calc_di_metric(raw_h_B, d))
+    min_B, max_B = min(temp_dis_B), max(temp_dis_B)
+    
+    # --- PART 2: Structure A Validation ---
+    print("\n>>> Structure A Validation")
+    norm_A, n_samples_A = normalize_data(raw_h_A, scaler_A)
+    with torch.no_grad():
+        z_a = encoder(torch.FloatTensor(norm_A).to(cfg.device)).detach().cpu().numpy()
+        
+    real_dis_A, gen_dis_A = [], []
+    print(f"\n   {'Case':<10} | {'Real DI':<10} | {'Input':<10} | {'Gen DI':<10}")
+    print("-" * 50)
+    
+    for i, case in enumerate(cfg.DAMAGE_CASES_A):
+        real_di = temp_dis_A[i]
+        input_di = rescale_di(real_di, min_A, max_A)
+        
+        # Predict
+        b_in = np.hstack([z_a, np.full((n_samples_A, 1), input_di)])
+        preds = []
+        with torch.no_grad():
+            for k in range(0, len(b_in), 5000):
+                b_batch = torch.FloatTensor(b_in[k:k+5000]).to(cfg.device)
+                B_out = deeponet.branch(b_batch)
+                T_out = deeponet.trunk(deeponet.fourier(trunk_fixed))
+                p = torch.matmul(B_out, T_out.T) + deeponet.bias
+                preds.append(p.detach().cpu().numpy())
+        
+        # Reconstruct: Healthy + Residual
+        pred_res_norm = np.vstack(preds)
+        gen_norm = norm_A + pred_res_norm
+        gen_phys = scaler_A.inverse_transform(gen_norm)
+        gen_data = gen_phys.reshape(n_samples_A, 8, cfg.WINDOW_SIZE).transpose(1, 0, 2).reshape(8, -1)
+        
+        gen_di = calc_di_metric(raw_h_A, gen_data)
+        real_dis_A.append(real_di); gen_dis_A.append(gen_di)
+        print(f"   f{case:<9} | {real_di:.6f}   | {input_di:.4f}     | {gen_di:.6f}")
+
+    # --- PART 3: Structure B Validation ---
+    print("\n>>> Structure B Validation")
+    norm_B, n_samples_B = normalize_data(raw_h_B, scaler_B)
+    with torch.no_grad():
+        z_b = encoder(torch.FloatTensor(norm_B).to(cfg.device)).detach().cpu().numpy()
+        
+    real_dis_B, gen_dis_B = [], []
+    print(f"\n   {'Case':<10} | {'Real DI':<10} | {'Input':<10} | {'Gen DI':<10}")
+    print("-" * 50)
+    
+    for i, case in enumerate(cfg.DAMAGE_CASES_B):
+        real_di = temp_dis_B[i]
+        input_di = rescale_di(real_di, min_B, max_B)
+        
+        # Predict
+        b_in = np.hstack([z_b, np.full((n_samples_B, 1), input_di)])
+        preds = []
+        with torch.no_grad():
+            for k in range(0, len(b_in), 5000):
+                b_batch = torch.FloatTensor(b_in[k:k+5000]).to(cfg.device)
+                B_out = deeponet.branch(b_batch)
+                T_out = deeponet.trunk(deeponet.fourier(trunk_fixed))
+                p = torch.matmul(B_out, T_out.T) + deeponet.bias
+                preds.append(p.detach().cpu().numpy())
+                
+        # Reconstruct
+        pred_res_norm = np.vstack(preds)
+        gen_norm = norm_B + pred_res_norm
+        gen_phys = scaler_B.inverse_transform(gen_norm)
+        gen_data = gen_phys.reshape(n_samples_B, 8, cfg.WINDOW_SIZE).transpose(1, 0, 2).reshape(8, -1)
+        
+        gen_di = calc_di_metric(raw_h_B, gen_data)
+        real_dis_B.append(real_di); gen_dis_B.append(gen_di)
+        print(f"   Case {case:<4} | {real_di:.6f}   | {input_di:.4f}     | {gen_di:.6f}")
+
+    # --- PART 4: Plots ---
+    print("\n>>> Generating Comparison Plots...")
+    plt.figure(figsize=(10, 6))
+    plt.plot(cfg.DAMAGE_CASES_A, real_dis_A, 'k--o', label='Real A DI')
+    plt.plot(cfg.DAMAGE_CASES_A, gen_dis_A, 'b-s', label='Generated A DI')
+    plt.title("Structure A: Real vs Gen DI")
+    plt.legend(); plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(cfg.CODE_DIR, "final_A_trend.png"))
+    plt.show()
+    
+    plt.figure(figsize=(10, 6))
+    plt.plot(cfg.DAMAGE_CASES_B, real_dis_B, 'k--o', label='Real B DI')
+    plt.plot(cfg.DAMAGE_CASES_B, gen_dis_B, 'r-s', label='Generated B DI')
+    plt.title("Structure B: Real vs Gen DI (DANN-DeepONet)")
+    plt.legend(); plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(cfg.CODE_DIR, "final_B_trend.png"))
+    plt.show()
+    
+    # Detailed Vis
+    raw_d_A_50 = load_data(os.path.join(cfg.DIR_A, "f5_accelerations.dat"), is_A=True)
+    visualize_comparison("Final_A_50", raw_h_A, raw_d_A_50, 0.35, encoder, deeponet, scaler_A, trunk_fixed)
+    
+    raw_d_B_48 = load_data(os.path.join(cfg.DIR_B, "D1_48_1.txt"), is_A=False)
+    visualize_comparison("Final_B_48", raw_h_B, raw_d_B_48, 0.95, encoder, deeponet, scaler_B, trunk_fixed)
+
+if __name__ == "__main__":
+    main()
