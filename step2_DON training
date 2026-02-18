@@ -1,0 +1,305 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Feb 18 17:19:47 2026
+
+@author: Oilsmell
+"""
+
+# -*- coding: utf-8 -*-
+"""
+[Step 5] DeepONet Training with DANN Encoder
+Location: E:\2ndstructuredata\Code_3_SN_AE_CF\step5_deeponet_training.py
+Goal: 
+    1. Load pre-trained DANN Encoder (Frozen).
+    2. Train DeepONet (Branch & Trunk) to predict Residuals.
+    3. Input: [z, DI] (Branch) + [t, x] (Trunk).
+    4. Target: Residual (Damaged - Healthy).
+"""
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+import os
+import pickle
+from sklearn.preprocessing import MinMaxScaler
+import matplotlib.pyplot as plt
+
+# =========================================================
+# 1. Configuration
+# =========================================================
+class Config:
+    DIR_A = r"E:\Benchmark Code\benchmarktu1402-master\f_accerlerations\ds1"
+    DIR_B = r"E:\2ndstructuredata\raw data" # Not used for training, but good for ref
+    SAVE_DIR = r"E:\2ndstructuredata\Code_3_SN_AE_CF"
+    
+    # Models
+    ENCODER_PATH = os.path.join(SAVE_DIR, "encoder_dann.pth")
+    SCALER_A_PATH = os.path.join(SAVE_DIR, "scaler_A_dann.pkl")
+    
+    # Training Params
+    WINDOW_SIZE = 128
+    LATENT_DIM = 8
+    BRANCH_DIM = 9  # latent_dim (8) + DI (1)
+    TRUNK_DIM = 2   # t, x
+    HIDDEN_DIM = 128
+    
+    BATCH_SIZE = 128 # Larger batch for DeepONet
+    EPOCHS = 1000    # DeepONet needs more epochs usually
+    LR = 0.001
+    
+    SELECTED_NODES = [3, 21, 39, 57, 63, 81, 99, 117]
+    DAMAGE_CASES_A = list(range(1, 11)) # f1 ~ f10
+    
+    # DI Rescaling (Same as Step 3/4 logic)
+    # Target Range: [0.1, 1.0]
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+cfg = Config()
+
+# =========================================================
+# 2. Model Definitions
+# =========================================================
+
+# Encoder (Must match Step 4 definition exactly)
+class Encoder(nn.Sequential):
+    def __init__(self, input_dim=128*8, latent_dim=8):
+        super().__init__(
+            nn.Linear(input_dim, 512), nn.Tanh(),
+            nn.Linear(512, 256), nn.Tanh(),
+            nn.Linear(256, 64), nn.Tanh(),
+            nn.Linear(64, latent_dim)
+        )
+
+# Fourier Feature for Trunk
+class FourierFeature(nn.Module):
+    def __init__(self, input_dim, mapping_size=128, scale=10):
+        super().__init__()
+        self.register_buffer('B', torch.randn(input_dim, mapping_size) * scale)
+    def forward(self, x):
+        projected = 2 * np.pi * (x @ self.B)
+        return torch.cat([torch.sin(projected), torch.cos(projected)], dim=-1)
+
+# DeepONet
+class DeepONet(nn.Module):
+    def __init__(self, branch_dim, trunk_dim, hidden_dim=128):
+        super().__init__()
+        # Branch Net: Takes [z, DI] -> Output Features
+        self.branch = nn.Sequential(
+            nn.Linear(branch_dim, hidden_dim), nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        
+        # Trunk Net: Takes [t, x] -> Fourier -> Output Features
+        self.fourier = FourierFeature(trunk_dim)
+        self.trunk = nn.Sequential(
+            nn.Linear(256, hidden_dim), nn.SiLU(), # Fourier output is 256 (128*2)
+            nn.Linear(hidden_dim, hidden_dim), nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        
+        self.bias = nn.Parameter(torch.zeros(1))
+
+    def forward(self, branch_in, trunk_in):
+        # branch_in: (Batch, 9)
+        # trunk_in:  (Batch, 1024, 2) or Fixed (1024, 2)
+        
+        B_out = self.branch(branch_in) # (Batch, 128)
+        
+        # If trunk is fixed grid, we can precompute or pass it
+        # Here we assume trunk_in is the grid coordinates repeated or fixed
+        T_out = self.trunk(self.fourier(trunk_in)) # (Points, 128)
+        
+        # Output: (Batch, Points)
+        # B_out (N, H), T_out (M, H) -> (N, M)
+        return torch.matmul(B_out, T_out.T) + self.bias
+
+# =========================================================
+# 3. Data Loading & Preparation
+# =========================================================
+def load_data(path):
+    try:
+        data = np.loadtxt(path)
+        if data.shape[0] > data.shape[1]: 
+            data = data[:, cfg.SELECTED_NODES].T
+        else: 
+            data = data[cfg.SELECTED_NODES, :]
+        
+        # Trim
+        n_samples = data.shape[1] // cfg.WINDOW_SIZE
+        data = data[:, :n_samples * cfg.WINDOW_SIZE]
+        
+        return data.astype(np.float32)
+    except Exception as e:
+        print(f"Error loading {path}: {e}")
+        return None
+
+def calc_di(healthy, damaged):
+    # Kurtosis based DI
+    from scipy.stats import kurtosis
+    di_list = []
+    # Calc per channel, simplify for robust DI
+    # Using simple variance/energy change or just pre-calculated stats is fine too
+    # Let's stick to the Kurtosis metric used before
+    window = 2000
+    n_wins = healthy.shape[1] // window
+    if n_wins < 1: n_wins = 1; window = healthy.shape[1]
+    
+    for i in range(8):
+        h = healthy[i, :n_wins*window].reshape(n_wins, window)
+        d = damaged[i, :n_wins*window].reshape(n_wins, window)
+        k_h = kurtosis(h, axis=1, fisher=False)
+        k_d = kurtosis(d, axis=1, fisher=False)
+        di_list.append(abs(np.percentile(k_h, 95) - np.percentile(k_d, 95)))
+    return np.mean(di_list)
+
+def prepare_dataset(encoder, scaler_A):
+    print("   -> Preparing DeepONet Dataset (Structure A)...")
+    
+    # 1. Load Healthy A
+    raw_h = load_data(os.path.join(cfg.DIR_A, "fh_accelerations.dat"))
+    
+    # Normalize Healthy for Encoder
+    # Reshape: (8, N*W) -> (N, 8*W) for Scaler
+    n_samples = raw_h.shape[1] // cfg.WINDOW_SIZE
+    reshaped_h = raw_h.reshape(8, n_samples, cfg.WINDOW_SIZE).transpose(1, 0, 2).reshape(n_samples, -1)
+    norm_h = scaler_A.transform(reshaped_h)
+    
+    # Get Latent z (Fixed for Healthy)
+    # In this logic, Healthy state produces a baseline z.
+    # Actually, we should get z for EACH window if we assume z varies slightly?
+    # Or is z constant for the structure? 
+    # Usually z represents "Current State". Since we add Residual to Healthy,
+    # The input z should probably be the Healthy z (Baseline).
+    with torch.no_grad():
+        z_h = encoder(torch.FloatTensor(norm_h).to(cfg.device)).cpu().numpy() # (N, 8)
+    
+    # 2. Load Damaged Cases & Calculate Residuals
+    all_branch_inputs = [] # [z, DI]
+    all_targets = []       # [Residual]
+    
+    # Calculate DI range for A first to rescale [0.1, 1.0]
+    di_vals = []
+    for c in cfg.DAMAGE_CASES_A:
+        raw_d = load_data(os.path.join(cfg.DIR_A, f"f{c}_accelerations.dat"))
+        di_vals.append(calc_di(raw_h, raw_d))
+    min_di, max_di = min(di_vals), max(di_vals)
+    
+    print(f"      DI Range A: {min_di:.6f} ~ {max_di:.6f}")
+    
+    for i, c in enumerate(cfg.DAMAGE_CASES_A):
+        raw_d = load_data(os.path.join(cfg.DIR_A, f"f{c}_accelerations.dat"))
+        
+        # Calculate Target Residual
+        # Residual = Damaged - Healthy
+        # Note: We must be careful about phase/alignment.
+        # DeepONet learns the mapping: (State, DI) -> Residual Waveform
+        # Here we assume element-wise subtraction is valid (synchronized).
+        residual = raw_d - raw_h 
+        
+        # Normalize Residual?
+        # Option 1: Train on Physical Residual (Scaler handled outside)
+        # Option 2: Train on Normalized Residual (Using Scaler A)
+        # Let's use Normalized Residual to match the AE logic.
+        # Norm_Res = Norm_Damaged - Norm_Healthy
+        reshaped_d = raw_d.reshape(8, n_samples, cfg.WINDOW_SIZE).transpose(1, 0, 2).reshape(n_samples, -1)
+        norm_d = scaler_A.transform(reshaped_d)
+        target_res_norm = norm_d - norm_h # (N, 1024)
+        
+        # DI Input
+        real_di = di_vals[i]
+        input_di = 0.1 + (real_di - min_di) / (max_di - min_di) * 0.9 # [0.1, 1.0] Scaling
+        
+        # Build Inputs
+        # Branch: z (from Healthy) + DI
+        # We repeat DI for all samples
+        di_vec = np.full((n_samples, 1), input_di)
+        branch_in = np.hstack([z_h, di_vec]) # (N, 9)
+        
+        all_branch_inputs.append(branch_in)
+        all_targets.append(target_res_norm)
+        
+    X_branch = np.vstack(all_branch_inputs)
+    Y_target = np.vstack(all_targets)
+    
+    return X_branch, Y_target
+
+# =========================================================
+# 4. Training Loop
+# =========================================================
+def train():
+    print("[DeepONet Training] Started...")
+    
+    # 1. Load Resources
+    with open(cfg.SCALER_A_PATH, 'rb') as f: scaler_A = pickle.load(f)
+    
+    encoder = Encoder().to(cfg.device)
+    encoder.load_state_dict(torch.load(cfg.ENCODER_PATH))
+    encoder.eval() # Freeze
+    for param in encoder.parameters(): param.requires_grad = False
+    
+    # 2. Prepare Data
+    X_b, Y_t = prepare_dataset(encoder, scaler_A)
+    
+    dataset = TensorDataset(torch.FloatTensor(X_b), torch.FloatTensor(Y_t))
+    loader = DataLoader(dataset, batch_size=cfg.BATCH_SIZE, shuffle=True)
+    
+    # 3. Initialize DeepONet
+    deeponet = DeepONet(branch_dim=cfg.BRANCH_DIM, trunk_dim=cfg.TRUNK_DIM).to(cfg.device)
+    optimizer = optim.Adam(deeponet.parameters(), lr=cfg.LR)
+    criterion = nn.MSELoss()
+    
+    # Trunk Grid (Fixed: t, x)
+    t_space = np.linspace(0, 1, cfg.WINDOW_SIZE)
+    x_space = np.linspace(0, 1, 8) # 8 sensors
+    T_grid, X_grid = np.meshgrid(t_space, x_space)
+    # Shape: (1024, 2)
+    trunk_input = torch.FloatTensor(np.stack([T_grid.flatten(), X_grid.flatten()], axis=1)).to(cfg.device)
+    
+    # 4. Train
+    print(f"   -> Training DeepONet for {cfg.EPOCHS} epochs...")
+    loss_history = []
+    
+    for epoch in range(cfg.EPOCHS):
+        deeponet.train()
+        total_loss = 0
+        
+        for b_in, target in loader:
+            b_in, target = b_in.to(cfg.device), target.to(cfg.device)
+            
+            optimizer.zero_grad()
+            
+            # Forward
+            # Trunk is reused for all batch items
+            preds = deeponet(b_in, trunk_input)
+            
+            loss = criterion(preds, target)
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+            
+        avg_loss = total_loss / len(loader)
+        loss_history.append(avg_loss)
+        
+        if (epoch+1) % 100 == 0:
+            print(f"   Epoch {epoch+1}/{cfg.EPOCHS} | Loss: {avg_loss:.6f}")
+            
+    # 5. Save
+    torch.save(deeponet.state_dict(), os.path.join(cfg.SAVE_DIR, "deeponet_model.pth"))
+    
+    # Plot Loss
+    plt.figure()
+    plt.plot(loss_history)
+    plt.title("DeepONet Training Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("MSE Loss")
+    plt.savefig(os.path.join(cfg.SAVE_DIR, "deeponet_loss.png"))
+    plt.show()
+    print("   -> DeepONet Model Saved.")
+
+if __name__ == "__main__":
+    train()
